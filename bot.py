@@ -4,7 +4,8 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 import yt_dlp
 import tempfile
-import subprocess
+import glob
+import time
 
 # Enable logging
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
@@ -152,6 +153,30 @@ class YouTubeBot:
                 parse_mode='Markdown'
             )
     
+    def find_downloaded_file(self, temp_dir, expected_ext=None):
+        """Better file finding function."""
+        # Wait a moment for files to be written
+        time.sleep(2)
+        
+        # List all files in temp directory
+        all_files = glob.glob(f'{temp_dir}/*')
+        
+        # Filter out directories, only keep files
+        files = [f for f in all_files if os.path.isfile(f)]
+        
+        if not files:
+            return None
+        
+        # If we have an expected extension, try to find files with that extension first
+        if expected_ext:
+            ext_files = [f for f in files if f.lower().endswith(expected_ext.lower())]
+            if ext_files:
+                # Return the largest file with correct extension
+                return max(ext_files, key=os.path.getsize)
+        
+        # Otherwise return the largest file (likely the main download)
+        return max(files, key=os.path.getsize)
+    
     async def download_and_send(self, update: Update, context: ContextTypes.DEFAULT_TYPE, choice: str):
         """Download and send the file."""
         query = update.callback_query
@@ -176,13 +201,13 @@ class YouTubeBot:
                         'preferredcodec': 'mp3',
                         'preferredquality': quality,
                     }]
-                    file_ext = 'mp3'
+                    expected_ext = '.mp3'
                 else:
                     # Video download
                     quality = choice.replace('video_', '')
-                    ydl_opts['format'] = f'best[height<={quality}][ext=mp4]+bestaudio[ext=m4a]/best[height<={quality}]'
+                    ydl_opts['format'] = f'bestvideo[height<={quality}]+bestaudio/best[height<={quality}]'
                     ydl_opts['merge_output_format'] = 'mp4'
-                    file_ext = 'mp4'
+                    expected_ext = '.mp4'
                 
                 # Add more options to avoid 403 error
                 ydl_opts.update({
@@ -198,16 +223,14 @@ class YouTubeBot:
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     ydl.download([url])
                 
-                # Find downloaded file
-                import glob
-                import os
-                files = glob.glob(f'{temp_dir}/*.{file_ext}')
-                if not files:
-                    files = glob.glob(f'{temp_dir}/*')
+                # Find the downloaded file
+                downloaded_file = self.find_downloaded_file(temp_dir, expected_ext)
                 
-                if files:
-                    downloaded_file = files[0]
+                if downloaded_file and os.path.exists(downloaded_file):
                     file_size = os.path.getsize(downloaded_file) / (1024 * 1024)  # Size in MB
+                    file_name = os.path.basename(downloaded_file)
+                    
+                    logger.info(f"Found file: {file_name}, Size: {file_size:.1f}MB")
                     
                     # Check if file is too large for Telegram (50MB limit)
                     if file_size > 45:  # Leave some margin
@@ -218,7 +241,7 @@ class YouTubeBot:
                         return
                     
                     # Upload to Telegram
-                    await query.edit_message_text("📤 **Uploading to Telegram...**", parse_mode='Markdown')
+                    await query.edit_message_text(f"📤 **Uploading...** ({file_size:.1f}MB)", parse_mode='Markdown')
                     
                     with open(downloaded_file, 'rb') as f:
                         if choice.startswith('audio_'):
@@ -247,14 +270,25 @@ class YouTubeBot:
                     
                     await query.delete_message()
                 else:
-                    await query.edit_message_text("❌ Could not find downloaded file")
+                    # List all files in temp_dir for debugging
+                    all_files = glob.glob(f'{temp_dir}/*')
+                    logger.error(f"Files in temp dir: {all_files}")
+                    
+                    await query.edit_message_text(
+                        "❌ Could not find downloaded file. This might be a temporary issue.\n"
+                        "Please try again with a different quality option."
+                    )
                     
             except Exception as e:
                 error_msg = str(e)
+                logger.error(f"Download error: {error_msg}")
+                
                 if "403" in error_msg:
                     await query.edit_message_text(
-                        "❌ YouTube is blocking the download. Trying alternative method...\n"
-                        "Please try again in a few minutes or try a different video."
+                        "❌ YouTube is blocking the download. Please try:\n"
+                        "• A different video\n"
+                        "• A lower quality\n"
+                        "• Wait a few minutes and try again"
                     )
                 else:
                     await query.edit_message_text(f"❌ Download error: {error_msg[:200]}")
